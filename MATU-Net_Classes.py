@@ -204,43 +204,28 @@ class OutputHead(nn.Module):
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
-        """
-        Focal Loss for classification
-        
-        Args:
-            alpha: Optional weighting factor for class balance (can be tensor or list)
-            gamma: Focusing parameter - higher values focus more on hard examples
-            reduction: 'mean', 'sum' or 'none'
-        """
         super(FocalLoss, self).__init__()
         self.gamma = gamma
         self.reduction = reduction
         self.alpha = alpha
         
-        if alpha is not None:
-            if isinstance(alpha, (list, np.ndarray)):
-                self.alpha = torch.FloatTensor(alpha)
-            self.alpha = self.alpha.view(-1, 1)
-            
     def forward(self, inputs, targets):
-        """
-        Args:
-            inputs: tensor of shape [batch_size, num_classes]
-            targets: tensor of shape [batch_size] with class indices
-        """
-        # Convert targets to one-hot encoding
-        targets_one_hot = F.one_hot(targets.long(), num_classes=inputs.size(1)).float()
-        # Compute cross entropy
-        CE = F.binary_cross_entropy_with_logits(inputs, targets_one_hot, reduction='none')
-        # Get probabilities
-        pt = torch.exp(-CE)
-        # Apply focusing parameter
-        focal_weight = (1 - pt) ** self.gamma
+        # inputs: [batch_size, num_classes]
+        # targets: [batch_size]
+        # Apply log_softmax for numerical stability
+        log_prob = F.log_softmax(inputs, dim=1)
+        prob = torch.exp(log_prob)
+        # Gather the probabilities of the target classes
+        targets = targets.view(-1, 1)  # Add dimension to match with gather operation
+        prob_target = prob.gather(1, targets).view(-1)
+        log_prob_target = log_prob.gather(1, targets).view(-1)
+        # Calculate focal weight
+        focal_weight = (1 - prob_target) ** self.gamma
         # Apply alpha if specified
         if self.alpha is not None:
-            alpha_t = self.alpha.gather(0, targets.long().view(-1))
-            focal_weight = focal_weight * alpha_t
-        loss = focal_weight * CE        
+            alpha_target = self.alpha.gather(0, targets.view(-1))
+            focal_weight = focal_weight * alpha_target
+        loss = -focal_weight * log_prob_target
         if self.reduction == 'mean':
             return loss.mean()
         elif self.reduction == 'sum':
@@ -250,14 +235,6 @@ class FocalLoss(nn.Module):
 
 class ClassBalancedLoss(nn.Module):
     def __init__(self, samples_per_class, beta=0.9999, gamma=0.5):
-        """
-        Class Balanced Loss from the paper "Class-Balanced Loss Based on Effective Number of Samples"
-        
-        Args:
-            samples_per_class: List/array containing number of samples per class
-            beta: Hyperparameter for computing effective number of samples (0.9-0.999)
-            gamma: Focusing parameter for Focal Loss component (0 = CE, >0 adds focusing)
-        """
         super(ClassBalancedLoss, self).__init__()
         self.beta = beta
         self.gamma = gamma
@@ -267,15 +244,27 @@ class ClassBalancedLoss(nn.Module):
         weights = (1.0 - beta) / np.array(effective_num)
         weights = weights / np.sum(weights) * len(samples_per_class)
         self.weights = torch.FloatTensor(weights)
-        self.focal_loss = FocalLoss(alpha=weights, gamma=gamma)
         
     def forward(self, inputs, targets):
-        """
-        Args:
-            inputs: tensor of shape [batch_size, num_classes]
-            targets: tensor of shape [batch_size] with class indices
-        """
-        return self.focal_loss(inputs, targets)
+        # Use our fixed FocalLoss implementation
+        device = inputs.device
+        self.weights = self.weights.to(device)
+        # Apply log_softmax for numerical stability
+        log_prob = F.log_softmax(inputs, dim=1)
+        prob = torch.exp(log_prob)
+        # Gather the probabilities of the target classes
+        targets = targets.view(-1, 1)  # Add dimension to match with gather operation
+        prob_target = prob.gather(1, targets).view(-1)
+        log_prob_target = log_prob.gather(1, targets).view(-1)
+        # Apply class weights
+        weights_target = self.weights.gather(0, targets.view(-1))
+        # Calculate focal weight
+        focal_weight = (1 - prob_target) ** self.gamma
+        # Combine weights
+        combined_weight = weights_target * focal_weight
+        loss = -combined_weight * log_prob_target
+        return loss.mean()
+    
 
 # Main Model
 class MATU_Net(nn.Module):
